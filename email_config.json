@@ -2,7 +2,7 @@
   "beingdigi.in": {
     "imap_host": "mail.redlake.in",
     "imap_port": 993,
-    "email_user": "catchall",
+    "email_user": "catchall@beingdigi.in",
     "email_pass": "Realbot@123##"
   }
 }
