@@ -11,6 +11,7 @@ import re
 from datetime import datetime
 from email.utils import parseaddr
 from email.header import decode_header
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -21,6 +22,8 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEFAULT_CLAIM_PASSWORD = os.getenv("DEFAULT_CLAIM_PASSWORD", "change-me")
+PORT = int(os.getenv("PORT", "10000"))
+
 DB_FILE = "db.json"
 EMAIL_CONFIG_FILE = "email_config.json"
 
@@ -31,6 +34,29 @@ user_sessions = {}
 db_lock = threading.Lock()
 app = None
 main_loop = None
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path in ("/", "/healthz"):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404)
+            self.send_header("Content-type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"not found")
+
+    def log_message(self, format, *args):
+        return
+
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    print(f"Health server listening on 0.0.0.0:{PORT}", flush=True)
+    server.serve_forever()
 
 
 def load_email_config():
@@ -56,11 +82,11 @@ def save_db(db):
 
 
 def extract_links(text):
-    return re.findall(r'(https?://\S+)', text or "")
+    return re.findall(r"(https?://\S+)", text or "")
 
 
 def extract_otp(text):
-    return re.findall(r'\b\d{4,8}\b', text or "")
+    return re.findall(r"\b\d{4,8}\b", text or "")
 
 
 def clean_html_to_view(html_content):
@@ -82,14 +108,14 @@ def clean_html_to_view(html_content):
 def decode_mime_header(value):
     if not value:
         return ""
-    decoded_parts = decode_header(value)
-    final = []
-    for part, enc in decoded_parts:
+    parts = decode_header(value)
+    out = []
+    for part, enc in parts:
         if isinstance(part, bytes):
-            final.append(part.decode(enc or "utf-8", errors="ignore"))
+            out.append(part.decode(enc or "utf-8", errors="ignore"))
         else:
-            final.append(part)
-    return "".join(final)
+            out.append(part)
+    return "".join(out)
 
 
 async def send_large_message(chat_id, text, prefix=""):
@@ -435,6 +461,9 @@ async def post_init(application):
 def main():
     global app
 
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
@@ -447,7 +476,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     print("Bot is starting...", flush=True)
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
