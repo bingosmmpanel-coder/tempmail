@@ -32,6 +32,7 @@ if not BOT_TOKEN:
 
 user_sessions = {}
 db_lock = threading.Lock()
+imap_check_lock = threading.Lock()
 app = None
 main_loop = None
 
@@ -68,17 +69,40 @@ def load_db():
     with db_lock:
         try:
             with open(DB_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                db = json.load(f)
         except FileNotFoundError:
-            return {"emails": {}, "users": {}}
+            db = {"emails": {}, "users": {}, "delivered_uids": {}}
         except json.JSONDecodeError:
-            return {"emails": {}, "users": {}}
+            db = {"emails": {}, "users": {}, "delivered_uids": {}}
+
+        if "emails" not in db:
+            db["emails"] = {}
+        if "users" not in db:
+            db["users"] = {}
+        if "delivered_uids" not in db:
+            db["delivered_uids"] = {}
+
+        return db
 
 
 def save_db(db):
     with db_lock:
         with open(DB_FILE, "w", encoding="utf-8") as f:
             json.dump(db, f, indent=2)
+
+
+def is_uid_already_delivered(db, domain, uid_value):
+    domain_store = db["delivered_uids"].setdefault(domain, [])
+    return uid_value in domain_store
+
+
+def mark_uid_delivered(db, domain, uid_value):
+    domain_store = db["delivered_uids"].setdefault(domain, [])
+    if uid_value not in domain_store:
+        domain_store.append(uid_value)
+
+    if len(domain_store) > 2000:
+        db["delivered_uids"][domain] = domain_store[-2000:]
 
 
 def extract_links(text):
@@ -139,7 +163,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/list - list your temp mails\n"
         "/delete - delete a temp mail\n"
         "/claim email@domain.com password - claim an email\n"
-        "/domains - show available domains"
+        "/domains - show available domains\n"
+        "/check - force check mail now"
     )
 
 
@@ -224,6 +249,31 @@ async def create(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def force_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    await update.message.reply_text("Checking inbox now...")
+
+    def run_manual_check():
+        try:
+            found = check_all_domains_once(trigger_user_id=uid, only_user_id=uid)
+            text = "Check complete."
+            if found > 0:
+                text += f" Found {found} new mail(s)."
+            else:
+                text += " No new mail found."
+            asyncio.run_coroutine_threadsafe(
+                app.bot.send_message(chat_id=int(uid), text=text),
+                main_loop
+            )
+        except Exception as e:
+            asyncio.run_coroutine_threadsafe(
+                app.bot.send_message(chat_id=int(uid), text=f"Manual check failed: {e}"),
+                main_loop
+            )
+
+    threading.Thread(target=run_manual_check, daemon=True).start()
+
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -295,7 +345,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = re.sub(r"[^a-z0-9._-]", "", raw_name)
 
         if not name:
-            await update.message.reply_text("Invalid username. Use letters and numbers.")
+            await update.message.reply_text("Invalid username. Use letters, numbers, ., _, -")
             return
 
         email_id = f"{name}@{domain}"
@@ -322,25 +372,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_sessions.pop(uid, None)
 
 
-def extract_target_email(msg, raw_message, domain):
-    for header in ["To", "Delivered-To", "Envelope-To", "X-Original-To"]:
+def extract_target_email(msg, raw_message, domain, db=None):
+    candidates = []
+
+    for header in ["To", "Delivered-To", "Envelope-To", "X-Original-To", "Cc", "Bcc"]:
         value = msg.get(header)
         if value:
             parsed = parseaddr(value)[1].lower()
-            if parsed.endswith(f"@{domain}"):
-                return parsed
+            if parsed:
+                candidates.append(parsed)
 
     for line in raw_message.splitlines():
         if ":" in line:
             key, val = line.split(":", 1)
-            if key.strip().lower() in {"envelope-to", "delivered-to", "x-original-to"}:
+            if key.strip().lower() in {
+                "envelope-to", "delivered-to", "x-original-to", "to", "cc", "bcc"
+            }:
                 parsed = parseaddr(val.strip())[1].lower()
-                if parsed.endswith(f"@{domain}"):
-                    return parsed
+                if parsed:
+                    candidates.append(parsed)
+
+    for candidate in candidates:
+        if candidate.endswith(f"@{domain}"):
+            return candidate
+
+    if db:
+        owned_emails = db.get("emails", {}).keys()
+        raw_lower = raw_message.lower()
+        for owned in owned_emails:
+            if owned.endswith(f"@{domain}") and owned.lower() in raw_lower:
+                return owned.lower()
+
     return ""
 
 
-def build_message_text(msg):
+def build_message_text(msg, received_email):
     subject = decode_mime_header(msg.get("Subject", ""))
     from_ = decode_mime_header(msg.get("From", ""))
 
@@ -382,6 +448,7 @@ def build_message_text(msg):
 
     text = (
         f"New Mail\n"
+        f"Received On: {received_email}\n"
         f"From: {from_}\n"
         f"Subject: {subject}\n\n"
         f"{final_body}"
@@ -396,49 +463,133 @@ def build_message_text(msg):
     return text
 
 
-def check_emails(domain, config):
+def get_message_uid(imap, msg_num):
+    uid_status, uid_data = imap.fetch(msg_num, "(UID)")
+    if uid_status != "OK" or not uid_data:
+        return None
+
+    for item in uid_data:
+        if isinstance(item, tuple):
+            text = item[0].decode(errors="ignore")
+            match = re.search(r"UID\s+(\d+)", text)
+            if match:
+                return match.group(1)
+
+    return None
+
+
+def scan_single_domain(domain, config, trigger_user_id=None, only_user_id=None):
+    db = load_db()
+    found_count = 0
+
+    imap = imaplib.IMAP4_SSL(config["imap_host"], config["imap_port"])
+    imap.login(config["email_user"], config["email_pass"])
+    imap.select("INBOX")
+
+    status, messages = imap.search(None, "ALL")
+    if status != "OK":
+        imap.logout()
+        return found_count
+
+    for msg_num in messages[0].split():
+        uid_value = get_message_uid(imap, msg_num)
+        if not uid_value:
+            continue
+
+        if is_uid_already_delivered(db, domain, uid_value):
+            continue
+
+        status, msg_data = imap.fetch(msg_num, "(RFC822)")
+        if status != "OK":
+            continue
+
+        for part in msg_data:
+            if not isinstance(part, tuple):
+                continue
+
+            raw_bytes = part[1]
+            raw_text = raw_bytes.decode(errors="ignore")
+            msg = email.message_from_bytes(raw_bytes)
+
+            to_email = extract_target_email(msg, raw_text, domain, db=db)
+            if not to_email:
+                print(f"[{domain}] could not detect recipient for UID={uid_value}", flush=True)
+                continue
+
+            owner_id = db["emails"].get(to_email, {}).get("user_id")
+            if not owner_id:
+                print(f"[{domain}] recipient {to_email} not owned in db for UID={uid_value}", flush=True)
+                continue
+
+            if only_user_id and str(owner_id) != str(only_user_id):
+                continue
+
+            text = build_message_text(msg, to_email)
+
+            asyncio.run_coroutine_threadsafe(
+                send_large_message(chat_id=int(owner_id), text=text),
+                main_loop
+            )
+
+            mark_uid_delivered(db, domain, uid_value)
+            save_db(db)
+            found_count += 1
+            print(f"[{domain}] delivered UID={uid_value} to {to_email}", flush=True)
+
+    imap.logout()
+
+    if trigger_user_id and found_count == 0:
+        print(f"Manual check by {trigger_user_id}: no new mail in {domain}", flush=True)
+
+    return found_count
+
+
+def check_all_domains_once(trigger_user_id=None, only_user_id=None):
+    if not imap_check_lock.acquire(blocking=False):
+        if trigger_user_id:
+            asyncio.run_coroutine_threadsafe(
+                app.bot.send_message(
+                    chat_id=int(trigger_user_id),
+                    text="A mail check is already running. Please wait a few seconds."
+                ),
+                main_loop
+            )
+        return 0
+
+    try:
+        config = load_email_config()
+        total_found = 0
+
+        for domain, cfg in config.items():
+            try:
+                total_found += scan_single_domain(
+                    domain=domain,
+                    config=cfg,
+                    trigger_user_id=trigger_user_id,
+                    only_user_id=only_user_id
+                )
+            except Exception as e:
+                print(f"[{domain}] IMAP error: {e}", flush=True)
+                if trigger_user_id:
+                    asyncio.run_coroutine_threadsafe(
+                        app.bot.send_message(
+                            chat_id=int(trigger_user_id),
+                            text=f"Check failed for {domain}: {e}"
+                        ),
+                        main_loop
+                    )
+
+        return total_found
+    finally:
+        imap_check_lock.release()
+
+
+def check_emails_loop():
     while True:
         try:
-            db = load_db()
-
-            imap = imaplib.IMAP4_SSL(config["imap_host"], config["imap_port"])
-            imap.login(config["email_user"], config["email_pass"])
-            imap.select("INBOX")
-
-            status, messages = imap.search(None, "UNSEEN")
-            if status == "OK":
-                for num in messages[0].split():
-                    status, msg_data = imap.fetch(num, "(RFC822)")
-                    if status != "OK":
-                        continue
-
-                    for part in msg_data:
-                        if not isinstance(part, tuple):
-                            continue
-
-                        raw_bytes = part[1]
-                        raw_text = raw_bytes.decode(errors="ignore")
-                        msg = email.message_from_bytes(raw_bytes)
-
-                        to_email = extract_target_email(msg, raw_text, domain)
-                        if not to_email:
-                            continue
-
-                        uid = db["emails"].get(to_email, {}).get("user_id")
-                        if not uid:
-                            continue
-
-                        text = build_message_text(msg)
-
-                        asyncio.run_coroutine_threadsafe(
-                            send_large_message(chat_id=int(uid), text=text),
-                            main_loop
-                        )
-
-            imap.logout()
-
+            check_all_domains_once()
         except Exception as e:
-            print(f"[{domain}] IMAP error: {e}", flush=True)
+            print(f"Background check error: {e}", flush=True)
 
         time.sleep(30)
 
@@ -447,15 +598,9 @@ async def post_init(application):
     global main_loop
     main_loop = asyncio.get_running_loop()
 
-    config = load_email_config()
-    for domain, cfg in config.items():
-        thread = threading.Thread(
-            target=check_emails,
-            args=(domain, cfg),
-            daemon=True
-        )
-        thread.start()
-        print(f"Started IMAP watcher for {domain}", flush=True)
+    thread = threading.Thread(target=check_emails_loop, daemon=True)
+    thread.start()
+    print("Started background IMAP watcher", flush=True)
 
 
 def main():
@@ -464,7 +609,7 @@ def main():
     health_thread = threading.Thread(target=run_health_server, daemon=True)
     health_thread.start()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("create", create))
@@ -472,11 +617,23 @@ def main():
     app.add_handler(CommandHandler("delete", delete_mail))
     app.add_handler(CommandHandler("domains", domains))
     app.add_handler(CommandHandler("claim", claim))
+    app.add_handler(CommandHandler("check", force_check))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("Bot is starting...", flush=True)
-    app.run_polling(drop_pending_updates=True)
+    async def runner():
+        global main_loop
+        main_loop = asyncio.get_running_loop()
+        await post_init(app)
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+        print("Bot is starting...", flush=True)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(runner())
+    loop.run_forever()
 
 
 if __name__ == "__main__":
